@@ -380,7 +380,8 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # state ceiling; anything past that is real divergence, not flush-lag.
 #
 # The threshold floor scales with whatever ``hnsw:sync_threshold`` the
-# collection was created with (read via :func:`_read_sync_threshold`).
+# collection was created with (read via
+# :func:`_collection_hnsw_sync_threshold`).
 # ``_HNSW_DIVERGENCE_FALLBACK_FLOOR`` is the floor used when we can't
 # read the collection metadata (older palaces missing the row, sqlite
 # unreadable). 2000 = 2 × chromadb's default sync_threshold of 1000.
@@ -395,47 +396,55 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # expected steady-state lag.
 _HNSW_DIVERGENCE_FALLBACK_FLOOR = 2000
 _HNSW_DIVERGENCE_FRACTION = 0.10
+_HNSW_DEFAULT_SYNC_THRESHOLD = 1000
 
 
-def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
-    """Return the ``hnsw:sync_threshold`` for a collection, or 1000 default.
-
-    The configured sync_threshold drives chromadb's HNSW flush cadence —
-    larger values mean fewer, bigger flushes (less index-bloat risk per
-    PR #1191) but also larger steady-state lag between
-    ``index_metadata.pickle`` and the live sqlite count. The divergence
-    probe scales its tolerance to ``2 × sync_threshold`` so that lag is
-    not mistaken for corruption.
-
-    Falls back to 1000 (chromadb's own default) if the collection has no
-    explicit setting — matches what older mempalace palaces were created
-    with before PR #1191.
-    """
+def _collection_hnsw_sync_threshold(palace_path: str, collection_name: str) -> Optional[int]:
+    """Return the persisted Chroma ``hnsw:sync_threshold`` for a collection."""
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
-        return 1000
+        return None
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT cm.int_value
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(collection_metadata)")}
+            value_columns = [name for name in ("int_value", "float_value", "str_value") if name in columns]
+            if not value_columns:
+                return None
+
+            select_expr = "COALESCE(" + ", ".join(f"cm.{name}" for name in value_columns) + ")"
+            row = conn.execute(
+                f"""
+                SELECT {select_expr}
                 FROM collection_metadata cm
                 JOIN collections c ON cm.collection_id = c.id
                 WHERE c.name = ? AND cm.key = 'hnsw:sync_threshold'
+                LIMIT 1
                 """,
                 (collection_name,),
-            )
-            row = cur.fetchone()
-            if row and row[0] is not None:
-                return int(row[0])
-            return 1000
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            threshold = int(float(row[0]))
+            return threshold if threshold > 0 else None
         finally:
             conn.close()
-    except Exception:
-        logger.debug("_read_sync_threshold failed", exc_info=True)
-        return 1000
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+
+
+def _hnsw_divergence_threshold(
+    palace_path: str, collection_name: str, sqlite_count: int
+) -> int:
+    sync_threshold = (
+        _collection_hnsw_sync_threshold(palace_path, collection_name)
+        or _HNSW_DEFAULT_SYNC_THRESHOLD
+    )
+    return max(
+        _HNSW_DIVERGENCE_FALLBACK_FLOOR,
+        int(sqlite_count * _HNSW_DIVERGENCE_FRACTION),
+        sync_threshold * 2,
+    )
 
 
 def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_drawers") -> dict:
@@ -483,18 +492,14 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
         hnsw_count = _hnsw_element_count(palace_path, seg_id)
         out["hnsw_count"] = hnsw_count
 
-        sync_threshold = _read_sync_threshold(palace_path, collection_name)
-        # Two synchronization windows worth — see comment above
-        # _HNSW_DIVERGENCE_FALLBACK_FLOOR for the rationale.
-        divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
-
         if hnsw_count is None:
             # No pickle yet — segment hasn't persisted metadata. Could be
             # fresh-but-unflushed (normal) or interrupted-mid-flush (bad).
             # We can't distinguish without the pickle, so only flag
             # divergence when sqlite holds clearly more than two flush
             # windows worth — same threshold as the with-pickle path.
-            if sqlite_count > divergence_floor:
+            threshold = _hnsw_divergence_threshold(palace_path, collection_name, sqlite_count)
+            if sqlite_count > threshold:
                 out["status"] = "diverged"
                 out["diverged"] = True
                 out["divergence"] = sqlite_count
@@ -504,12 +509,16 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
                     "until the segment is rebuilt. Run `mempalace repair`."
                 )
             else:
-                out["message"] = "HNSW segment metadata not yet flushed; skipping"
+                out["status"] = "ok"
+                out["message"] = (
+                    "HNSW segment metadata not yet flushed; sqlite count is within "
+                    f"the configured sync window ({threshold:,})"
+                )
             return out
 
         divergence = sqlite_count - hnsw_count
         out["divergence"] = divergence
-        threshold = max(divergence_floor, int(sqlite_count * _HNSW_DIVERGENCE_FRACTION))
+        threshold = _hnsw_divergence_threshold(palace_path, collection_name, sqlite_count)
         if divergence > threshold:
             out["status"] = "diverged"
             out["diverged"] = True
