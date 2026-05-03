@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import chromadb
+from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from .base import (
     BaseBackend,
@@ -372,16 +373,28 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 
 
 # Divergence threshold: chromadb's HNSW flushes asynchronously, so HNSW
-# typically lags sqlite by up to the collection's ``hnsw:sync_threshold``
-# under active write load — that's the *brute-force batch* that hasn't
-# been compacted into HNSW yet, plus the un-persisted tail beyond the
-# last sync. Two synchronization windows worth is a safe steady-state
-# ceiling; anything past that is real divergence, not flush-lag.
+# typically lags sqlite by up to ``sync_threshold`` records under active
+# write load — that's the *brute-force batch* that hasn't been compacted
+# into HNSW yet, plus the un-persisted tail beyond the last sync. Two
+# synchronization windows worth (2 × sync_threshold) is a safe steady-
+# state ceiling; anything past that is real divergence, not flush-lag.
 #
-# The #1222 case was 176 613 missing out of 192 997 (91% gone) — orders
-# of magnitude past 2000. A typical post-mine palace shows a few hundred
-# to ~1000 missing, well under threshold.
-_HNSW_DIVERGENCE_ABSOLUTE = 2000
+# The threshold floor scales with whatever ``hnsw:sync_threshold`` the
+# collection was created with (read via
+# :func:`_collection_hnsw_sync_threshold`).
+# ``_HNSW_DIVERGENCE_FALLBACK_FLOOR`` is the floor used when we can't
+# read the collection metadata (older palaces missing the row, sqlite
+# unreadable). 2000 = 2 × chromadb's default sync_threshold of 1000.
+#
+# Why dynamic: PR #1191 set ``hnsw:sync_threshold = 50_000`` to prevent
+# index bloat, which means flush-lag can grow up to 50K naturally. A
+# fixed 2000 floor would flag every actively-written palace as DIVERGED
+# the moment its queue exceeded 10% of sqlite_count, even though chromadb
+# is behaving correctly. The floor must scale with sync_threshold to
+# distinguish real corruption (#1222 was 176 613 missing of 192 997 —
+# orders of magnitude past 2 × any reasonable sync_threshold) from
+# expected steady-state lag.
+_HNSW_DIVERGENCE_FALLBACK_FLOOR = 2000
 _HNSW_DIVERGENCE_FRACTION = 0.10
 _HNSW_DEFAULT_SYNC_THRESHOLD = 1000
 
@@ -428,7 +441,7 @@ def _hnsw_divergence_threshold(
         or _HNSW_DEFAULT_SYNC_THRESHOLD
     )
     return max(
-        _HNSW_DIVERGENCE_ABSOLUTE,
+        _HNSW_DIVERGENCE_FALLBACK_FLOOR,
         int(sqlite_count * _HNSW_DIVERGENCE_FRACTION),
         sync_threshold * 2,
     )
@@ -1090,15 +1103,18 @@ class ChromaBackend(BaseBackend):
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
 
         if create:
-            collection = client.get_or_create_collection(
-                collection_name,
-                metadata={
-                    "hnsw:space": hnsw_space,
-                    "hnsw:num_threads": 1,
-                    **_HNSW_BLOAT_GUARD,
-                },
-                **ef_kwargs,
-            )
+            try:
+                collection = client.get_collection(collection_name, **ef_kwargs)
+            except _ChromaNotFoundError:
+                collection = client.create_collection(
+                    collection_name,
+                    metadata={
+                        "hnsw:space": hnsw_space,
+                        "hnsw:num_threads": 1,
+                        **_HNSW_BLOAT_GUARD,
+                    },
+                    **ef_kwargs,
+                )
         else:
             collection = client.get_collection(collection_name, **ef_kwargs)
         _pin_hnsw_threads(collection)
